@@ -22,6 +22,37 @@ Cada API ejecuta el mismo simulador al arrancar. Genera lecturas para 500 sensor
 - Node.js 22 LTS y npm
 - Docker Desktop con Docker Compose v2
 
+## Instalar Docker en Windows
+
+Abre PowerShell como administrador. Si WSL 2 no está instalado, instala WSL y reinicia Windows cuando lo solicite:
+
+```powershell
+wsl --install
+```
+
+Después del reinicio, comprueba que WSL está disponible:
+
+```powershell
+wsl --update
+wsl --status
+```
+
+Instala Docker Desktop con WinGet:
+
+```powershell
+winget install --id Docker.DockerDesktop -e --accept-source-agreements --accept-package-agreements
+```
+
+Abre Docker Desktop desde el menú Inicio y espera a que indique que el motor está en ejecución. En Settings, habilita **Use the WSL 2 based engine** si todavía no está habilitado. Verifica la instalación desde PowerShell:
+
+```powershell
+docker --version
+docker compose version
+docker info
+```
+
+Si WinGet no está disponible, instala Docker Desktop desde [docker.com/products/docker-desktop](https://www.docker.com/products/docker-desktop/). La virtualización de hardware debe estar habilitada; en equipos administrados puede requerirse autorización de IT.
+
 ## Arranque desde cero
 
 1. Clona el repositorio y entra en la carpeta:
