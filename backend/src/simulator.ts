@@ -21,17 +21,46 @@ function seededRandom(seed: number) {
   };
 }
 
-async function insertBatch() {
-  const now = new Date();
-  const rnd = seededRandom(now.getTime() % 1000000);
+async function insertBatch(batchTime: Date, onBatchInserted: () => void) {
+  const rnd = seededRandom(batchTime.getTime() % 1000000);
   const values: string[] = [];
 
   for (const sensor of sensorSeeds) {
-    const temperature = Number((sensor.baseTemp + Math.sin(now.getTime() / 36000 + sensor.baseTemp) * 6 + (rnd() - 0.5) * 10).toFixed(2));
-    const humidity = Number((sensor.baseHumidity + Math.cos(now.getTime() / 28000 + sensor.baseTemp) * 8 + (rnd() - 0.5) * 14).toFixed(2));
-    const cpu = Number((sensor.baseCpu + Math.sin(now.getTime() / 22000 + sensor.baseTemp) * 22 + (rnd() - 0.5) * 28).toFixed(2));
-    const memory = Number((sensor.baseMemory + Math.cos(now.getTime() / 18000 + sensor.baseTemp) * 11 + (rnd() - 0.5) * 16).toFixed(2));
-    const network = Number((sensor.baseNetwork + Math.sin(now.getTime() / 15000 + sensor.baseTemp) * 18 + (rnd() - 0.5) * 30).toFixed(2));
+    const temperature = Number(
+      (
+        sensor.baseTemp +
+        Math.sin(batchTime.getTime() / 36000 + sensor.baseTemp) * 6 +
+        (rnd() - 0.5) * 10
+      ).toFixed(2),
+    );
+    const humidity = Number(
+      (
+        sensor.baseHumidity +
+        Math.cos(batchTime.getTime() / 28000 + sensor.baseTemp) * 8 +
+        (rnd() - 0.5) * 14
+      ).toFixed(2),
+    );
+    const cpu = Number(
+      (
+        sensor.baseCpu +
+        Math.sin(batchTime.getTime() / 22000 + sensor.baseTemp) * 22 +
+        (rnd() - 0.5) * 28
+      ).toFixed(2),
+    );
+    const memory = Number(
+      (
+        sensor.baseMemory +
+        Math.cos(batchTime.getTime() / 18000 + sensor.baseTemp) * 11 +
+        (rnd() - 0.5) * 16
+      ).toFixed(2),
+    );
+    const network = Number(
+      (
+        sensor.baseNetwork +
+        Math.sin(batchTime.getTime() / 15000 + sensor.baseTemp) * 18 +
+        (rnd() - 0.5) * 30
+      ).toFixed(2),
+    );
 
     const metrics = {
       temperature,
@@ -44,14 +73,23 @@ async function insertBatch() {
     for (const metric of SENSOR_TYPES) {
       const value = metrics[metric];
       const payload = {
-        unit: metric === "temperature" ? "C" : metric === "humidity" ? "%" : metric === "cpu" ? "%" : metric === "memory" ? "%" : "Mbps",
+        unit:
+          metric === "temperature"
+            ? "C"
+            : metric === "humidity"
+              ? "%"
+              : metric === "cpu"
+                ? "%"
+                : metric === "memory"
+                  ? "%"
+                  : "Mbps",
         source: "simulator",
         batch: "heavy-load-demo",
         district: sensor.district,
       };
 
       values.push(`(
-        '${now.toISOString()}',
+        '${batchTime.toISOString()}',
         '${sensor.sensor_id}',
         '${sensor.district}',
         '${metric}',
@@ -78,18 +116,43 @@ async function insertBatch() {
       value, source, metadata
     ) VALUES ${values.join(", ")}
   `);
+  onBatchInserted();
 }
 
-export function startSimulator() {
-  void insertBatch();
+export function startSimulator(onBatchInserted: () => void = () => {}) {
+  const intervalMs = Number(process.env.SIMULATOR_INTERVAL_MS ?? 2000);
+  if (!Number.isInteger(intervalMs) || intervalMs < 1000) {
+    throw new Error("SIMULATOR_INTERVAL_MS must be an integer greater than or equal to 1000");
+  }
 
-  const interval = setInterval(() => {
-    void insertBatch().catch((error) => {
+  let stopped = false;
+  let timeout: ReturnType<typeof setTimeout> | null = null;
+  const scheduleNextBatch = () => {
+    const now = Date.now();
+    const nextBatchTime = Math.floor(now / intervalMs) * intervalMs + intervalMs;
+    timeout = setTimeout(() => void runBatch(nextBatchTime), nextBatchTime - now);
+  };
+
+  const runBatch = async (batchTimestamp: number) => {
+    try {
+      await insertBatch(new Date(batchTimestamp), onBatchInserted);
+    } catch (error) {
       console.error("[simulator] error inserting batch:", error);
-    });
-  }, 250);
+    } finally {
+      if (!stopped) {
+        scheduleNextBatch();
+      }
+    }
+  };
+  scheduleNextBatch();
 
-  console.log(`[simulator] high-volume traffic generator active in ${dbMode} mode (${sensorSeeds.length * SENSOR_TYPES.length} rows/s approx)`);
+  const rowsPerSecond = (sensorSeeds.length * SENSOR_TYPES.length * 1000) / intervalMs;
+  console.log(
+    `[simulator] active in ${dbMode} mode (${rowsPerSecond} rows/s approx; interval ${intervalMs} ms, synchronized timestamps)`,
+  );
 
-  return () => clearInterval(interval);
+  return () => {
+    stopped = true;
+    if (timeout) clearTimeout(timeout);
+  };
 }

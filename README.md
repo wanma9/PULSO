@@ -4,7 +4,9 @@ Demo local de telemetria urbana para comparar consultas de series temporales ent
 
 ## Estado y procedencia de los datos
 
-Al cargar el dashboard, el navegador solicita `/api/overview` y `/api/queries/performance` a las dos APIs. Las APIs ejecutan consultas SQL sobre sus respectivas bases; las mediciones de rendimiento se cronometran en el backend. La serie principal del dashboard sigue generandose con el simulador local de `src/lib/simulation.ts`; el mini-panel del backend contrario usa los promedios de `/api/overview` como referencia visual. Por tanto, la lectura de las APIs y la medicion SQL son reales, pero el grafico principal aun no representa la serie historica devuelta por `/api/series`.
+El dashboard obtiene sus lecturas y agregados de las dos bases de datos; no genera datos de muestra en el navegador ni sustituye una API desconectada por valores ficticios. Cada API emite un evento Server-Sent Events (SSE) después de insertar correctamente una tanda. Al recibirlo, el navegador vuelve a consultar esa API, sin sondeo periódico de las lecturas.
+
+La consola de consultas ejecuta benchmarks al cargar el dashboard y los actualiza cada 30 segundos. Cada API envía sus consultas de prueba a su propia base mediante `EXPLAIN (ANALYZE, FORMAT JSON)` y muestra el `Execution Time` informado por el motor. Es tiempo interno de ejecución, no latencia HTTP de extremo a extremo. `EXPLAIN ANALYZE` ejecuta la consulta y devuelve el plan, no las filas de su `SELECT`. Las consultas de ambos motores son parecidas, pero algunas agrupaciones difieren; sus tiempos no representan una comparación estrictamente idéntica.
 
 ## Arquitectura
 
@@ -14,7 +16,16 @@ Navegador (Vite / TanStack Start, puerto 5173)
   +-- API TimescaleDB (puerto 4002) --------- TimescaleDB (puerto 5434)
 ```
 
-Cada API ejecuta el mismo simulador al arrancar. Genera lecturas para 500 sensores y cinco metricas, con una tanda cada 250 ms (aproximadamente 10 000 filas/s en cada base). En TimescaleDB, `sensor_readings` se convierte en hypertable; en PostgreSQL estandar se usan tablas e indices normales. Los datos son sinteticos y se conservan en volumenes Docker.
+Cada API ejecuta el mismo simulador: genera lecturas sintéticas para 500 sensores y cinco métricas, con una tanda cada 2 segundos por defecto (2.500 filas por tanda; aproximadamente 1.250 filas/s por base). Las tandas se alinean a intervalos comunes de reloj y sus valores se generan de forma determinista a partir de la marca de tiempo. Por eso, las filas de cada tanda coinciden mientras ambas APIs y bases estén disponibles y tengan el mismo `SIMULATOR_INTERVAL_MS`. Si una API o base está detenida, puede faltar una tanda en esa base. Las tandas de cada API se ejecutan en serie para evitar acumular escrituras.
+
+En TimescaleDB, `sensor_readings` se convierte en hypertable, con chunks de 5 minutos y política de compresión para chunks elegibles de más de 5 minutos. PostgreSQL estándar usa una tabla e índices normales. Los datos se conservan en volúmenes Docker.
+
+Para que el historial empiece limpio y se genere con el simulador sincronizado, se pueden reinicializar ambas bases. **Esto borra permanentemente todos los datos de ambos volúmenes.** No es necesario hacerlo para sincronizar las nuevas tandas:
+
+```powershell
+docker compose down -v
+docker compose up -d --build
+```
 
 ## Requisitos
 
@@ -68,7 +79,7 @@ Si WinGet no está disponible, instala Docker Desktop desde [docker.com/products
    docker compose up -d --build
    ```
 
-   La primera ejecucion descarga imagenes y compila la API; puede tardar unos minutos. Compose crea las tablas, crea la hypertable en TimescaleDB y arranca los simuladores cuando las APIs consiguen conectarse a sus bases.
+   La primera ejecución descarga imágenes y compila la API; puede tardar unos minutos. Al inicializar volúmenes vacíos se ejecutan los scripts SQL de `backend/sql`. Al arrancar, cada API también comprueba/crea la tabla y los índices y, en modo TimescaleDB, asegura la hypertable. Después comienza a insertar en los siguientes límites comunes del intervalo de 2 segundos.
 
 3. Instala las dependencias del frontend e inicia Vite:
 
@@ -103,7 +114,25 @@ Invoke-RestMethod http://localhost:4001/health
 Invoke-RestMethod http://localhost:4002/health
 ```
 
-El primer lote se inserta al iniciar cada API. Si una base acaba de arrancar, espera unos segundos y recarga el dashboard para que haya datos recientes.
+Las primeras tandas se insertan en los siguientes límites comunes del intervalo configurado (2 segundos por defecto). Si las bases acaban de arrancar, espera unos segundos y recarga el dashboard para ver lecturas recientes.
+
+### Comparar datos y filas entre las dos bases
+
+Desde PowerShell, en la raiz del proyecto, ejecuta:
+
+```powershell
+.\scripts\compare-databases.ps1
+```
+
+El script compara el tamaño lógico de cada base (`pg_database_size`), el número exacto de filas, tiempos y sensores distintos, rango temporal y, por métrica, recuento y valores mínimo, medio y máximo. Los recuentos exactos recorren la tabla y pueden tardar o consumir CPU en bases grandes. El tamaño lógico no necesariamente coincide con el tamaño del volumen Docker, que también contiene WAL y otros archivos. Necesita Docker Desktop y los contenedores `pulse-postgres-plain` y `pulse-postgres-timescale` activos. Si ambas APIs estuvieron disponibles, las tandas sincronizadas deben producir datos idénticos; cualquier interrupción puede causar diferencias en el historial. El script compara resúmenes, no verifica igualdad fila por fila.
+
+Para consultar las últimas 20 filas de cada base en paralelo:
+
+```powershell
+.\scripts\query_comparacion_bbdd.ps1
+```
+
+Este script muestra también el nombre de cada base (`pulse_timescale` y `pulse_plain`). Para comprobar igualdad exacta de las tablas se necesita comparar las filas completas, no solo los conteos o los agregados.
 
 ## Puertos y endpoints
 
@@ -115,7 +144,7 @@ El primer lote se inserta al iniciar cada API. Si una base acaba de arrancar, es
 | PostgreSQL | `localhost:5433` | Conexion directa a la base estandar |
 | TimescaleDB | `localhost:5434` | Conexion directa a TimescaleDB |
 
-En ambas APIs estan disponibles `GET /health`, `GET /api/config`, `GET /api/overview`, `GET /api/series`, `GET /api/alerts` y `GET /api/queries/performance`. Por ejemplo:
+En ambas APIs están disponibles `GET /health`, `GET /api/config`, `GET /api/overview`, `GET /api/dashboard?range=5m`, `GET /api/events`, `GET /api/series`, `GET /api/alerts` y `GET /api/queries/performance`. Los rangos del dashboard son `1m`, `5m`, `1h`, `24h` y `7d`. `/api/events` mantiene una conexión SSE y emite `readings-inserted` después de cada inserción correcta. `/api/queries/performance` mide ejecución en el motor mediante `EXPLAIN (ANALYZE, FORMAT JSON)`, por lo que informa tiempo interno, no latencia HTTP; el plan sustituye las filas normales del `SELECT`. Por ejemplo:
 
 ```text
 http://localhost:4001/api/series?metric=temperature&window=10m
@@ -150,7 +179,7 @@ docker compose down -v
 docker compose up -d --build
 ```
 
-Los scripts SQL de `backend/sql` se ejecutan automaticamente por la imagen de PostgreSQL solo cuando inicializa un volumen vacio. La API tambien verifica/crea el esquema al arrancar.
+Los scripts SQL de `backend/sql` se ejecutan automáticamente al inicializar un volumen vacío; no se vuelven a ejecutar al reiniciar un volumen ya existente. `backend/src/db.ts` también asegura la extensión TimescaleDB cuando corresponde, la tabla, la hypertable y los índices al arrancar la API. Esa comprobación no aplica la política de compresión: esta se configura en `backend/sql/init-timescale.sql` durante la inicialización de un volumen Timescale vacío.
 
 ## Desarrollo y compilacion
 

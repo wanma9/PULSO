@@ -1,15 +1,20 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Bars, LineChart, Sparkline } from "@/components/charts";
-import { DISTRICTS, RANGES, SENSORS, fmt, seriesFor, useSimulation, type Range, type SimState } from "@/lib/simulation";
 
 export const Route = createFileRoute("/")({
   head: () => ({
     meta: [
       { title: "PULSO — Sensores urbanos en tiempo real con TimescaleDB" },
-      { name: "description", content: "Demo de rendimiento de TimescaleDB: miles de sensores de ciudad enviando temperatura, humedad, aire y energía cada segundo." },
+      {
+        name: "description",
+        content: "Datos de sensores consultados desde PostgreSQL y TimescaleDB.",
+      },
       { property: "og:title", content: "PULSO — Sensores urbanos en tiempo real" },
-      { property: "og:description", content: "Series temporales masivas y análisis en tiempo real sobre TimescaleDB." },
+      {
+        property: "og:description",
+        content: "Datos de sensores consultados desde PostgreSQL y TimescaleDB.",
+      },
       { property: "og:type", content: "website" },
       { name: "twitter:card", content: "summary_large_image" },
     ],
@@ -17,163 +22,281 @@ export const Route = createFileRoute("/")({
   component: Dashboard,
 });
 
-const COLORS = ["var(--chart-1)", "var(--chart-2)", "var(--chart-3)", "var(--chart-4)", "var(--chart-5)", "var(--chart-6)"];
+const COLORS = [
+  "var(--chart-1)",
+  "var(--chart-2)",
+  "var(--chart-3)",
+  "var(--chart-4)",
+  "var(--chart-5)",
+  "var(--chart-6)",
+];
 const NAV = ["Resumen", "Sensores", "Consultas", "Alertas", "Mapa"];
 const BACKENDS = {
   timescale: "http://localhost:4002",
   plain: "http://localhost:4001",
 } as const;
+const RANGES = {
+  "1m": "1 s",
+  "5m": "2 s",
+  "1h": "1 min",
+  "24h": "15 min",
+  "7d": "2 h",
+} as const;
 
 type BackendMode = keyof typeof BACKENDS;
+type Range = keyof typeof RANGES;
+type MetricKey = "temperature" | "humidity" | "cpu" | "memory" | "network";
 
-type BackendOverviewRow = {
+type OverviewRow = {
   district: string;
-  avg_temperature: number;
-  avg_humidity: number;
-  avg_cpu: number;
-  avg_network: number;
-  peak_cpu: number;
+  avg_temperature: number | null;
+  avg_humidity: number | null;
+  avg_cpu: number | null;
+  avg_memory: number | null;
+  avg_network: number | null;
+  peak_cpu: number | null;
   samples: number;
+  humidity_samples: number;
+  cpu_samples: number;
+  memory_samples: number;
+  network_samples: number;
 };
 
-type BackendQueryRow = {
-  name: string;
-  ms: number;
-  rows: number;
+type SeriesRow = {
+  bucket: string;
+  district: string;
+} & Record<MetricKey, number | null> &
+  Record<`${MetricKey}_samples`, number>;
+
+type FeedRow = {
+  ts: string;
+  sensor_id: string;
+  district: string;
+  metric: string;
+  value: number;
 };
 
-type BackendComparison = {
-  timescale: BackendResponse | null;
-  plain: BackendResponse | null;
+type DashboardData = {
+  mode: BackendMode;
+  database: string;
+  range: Range;
+  stats: {
+    lastReadingAt: string | null;
+  };
+  overview: OverviewRow[];
+  series: SeriesRow[];
+  heatmap: { district: string; bucket: number; temperature: number | null; samples: number }[];
+  feed: FeedRow[];
 };
 
-async function fetchBackendComparison(): Promise<BackendComparison> {
-  const [timescale, plain] = await Promise.all([
-    fetchBackendSnapshot("timescale"),
-    fetchBackendSnapshot("plain"),
-  ]);
+type QueryResult = { name: string; title: string; ms: number; rows: number; sql: string };
+type PerformanceData = { averageMs: number; queries: QueryResult[] };
+type BackendSnapshot = {
+  dashboard: DashboardData | null;
+  performance: PerformanceData | null;
+  error: string | null;
+  performanceError: string | null;
+};
+type BackendComparison = Record<BackendMode, BackendSnapshot>;
 
-  return { timescale, plain };
+const emptySnapshot = (): BackendSnapshot => ({
+  dashboard: null,
+  performance: null,
+  error: null,
+  performanceError: null,
+});
+
+function formatNumber(value: number, decimals = 0) {
+  return value.toLocaleString("es-ES", {
+    minimumFractionDigits: decimals,
+    maximumFractionDigits: decimals,
+  });
 }
 
-async function fetchBackendSnapshot(mode: BackendMode): Promise<BackendResponse | null> {
+async function fetchBackendSnapshot(
+  mode: BackendMode,
+  range: Range,
+  includePerformance: boolean,
+): Promise<BackendSnapshot> {
   try {
     const base = BACKENDS[mode];
-    const [overviewRes, perfRes] = await Promise.all([
-      fetch(`${base}/api/overview`),
-      fetch(`${base}/api/queries/performance`),
+    const [dashboardResult, performanceResult] = await Promise.allSettled([
+      fetch(`${base}/api/dashboard?range=${range}`),
+      includePerformance ? fetch(`${base}/api/queries/performance`) : Promise.resolve(null),
     ]);
-
-    if (!overviewRes.ok || !perfRes.ok) {
-      return null;
+    if (dashboardResult.status === "rejected") throw dashboardResult.reason;
+    if (!dashboardResult.value.ok) {
+      throw new Error(`Dashboard: HTTP ${dashboardResult.value.status}`);
     }
 
-    const overview = (await overviewRes.json()) as { data?: BackendOverviewRow[]; mode?: BackendMode };
-    const performance = (await perfRes.json()) as {
-      averageMs?: number;
-      queries?: BackendQueryRow[];
-      benchmark?: { label?: string; summary?: string };
-      mode?: BackendMode;
-    };
-
+    const dashboard = (await dashboardResult.value.json()) as DashboardData;
+    if (dashboard.mode !== mode) {
+      throw new Error(`La API devolvió el modo ${dashboard.mode}, se esperaba ${mode}`);
+    }
+    let performance: PerformanceData | null = null;
+    let performanceError: string | null = null;
+    if (!includePerformance) {
+      return { dashboard, performance, error: null, performanceError };
+    }
+    if (performanceResult.status === "rejected") {
+      performanceError =
+        performanceResult.reason instanceof Error
+          ? performanceResult.reason.message
+          : "Error desconocido";
+    } else if (performanceResult.value === null) {
+      performanceError = "No se recibió la respuesta de rendimiento";
+    } else if (!performanceResult.value.ok) {
+      performanceError = `HTTP ${performanceResult.value.status}`;
+    } else {
+      try {
+        performance = (await performanceResult.value.json()) as PerformanceData;
+      } catch (error) {
+        performanceError =
+          error instanceof Error ? error.message : "Respuesta de rendimiento no válida";
+      }
+    }
+    return { dashboard, performance, error: null, performanceError };
+  } catch (error) {
     return {
-      overview: overview.data ?? [],
-      performance: {
-        averageMs: performance.averageMs ?? 0,
-        queries: performance.queries ?? [],
-        benchmark: performance.benchmark ?? {},
-      },
-      mode,
+      dashboard: null,
+      performance: null,
+      error:
+        error instanceof Error ? error.message : "Error desconocido al consultar la base de datos",
+      performanceError: null,
     };
-  } catch {
-    return null;
   }
 }
 
-function buildBenchFromBackendData(backend: BackendResponse | null): { title: string; sql: string; rows: string; tsdb: number; pg: number }[] {
-  if (!backend || backend.performance.queries.length === 0) {
-    return [];
-  }
-
-  const plain = backend.mode === "plain" ? backend : null;
-  const timescale = backend.mode === "timescale" ? backend : null;
-
-  const tsdbMs = timescale?.performance.averageMs ?? 0;
-  const pgMs = plain?.performance.averageMs ?? 0;
-
-  return backend.performance.queries.map((query) => ({
-    title: query.name === "rolling_window_avg" ? "Temperatura media por barrio" : query.name === "hot_spots" ? "Picos de contaminación" : "Consumo eléctrico (agregado continuo)",
-    sql: query.name === "rolling_window_avg" ? "SELECT time_bucket('2 seconds', ts) ..." : query.name === "hot_spots" ? "SELECT district, MAX(cpu) ..." : "SELECT time_bucket('1 minute', ts) ...",
-    rows: `${query.rows.toLocaleString("es-ES")} rows`,
-    tsdb: backend.mode === "timescale" ? query.ms : tsdbMs || query.ms,
-    pg: backend.mode === "plain" ? query.ms : pgMs || query.ms,
-  }));
-}
-
-function mergeWithBackendState(base: SimState, backend: BackendResponse | null, mode: BackendMode): SimState {
-  if (!backend) return base;
-
-  const bench = buildBenchFromBackendData(backend);
-
+function mergeSnapshot(previous: BackendSnapshot, next: BackendSnapshot): BackendSnapshot {
   return {
-    ...base,
-    ingest: mode === "timescale" ? 52840 : 42120,
-    totalRows: mode === "timescale" ? 4_983_662_130 : 3_512_404_900,
-    chunks: mode === "timescale" ? 18432 : 4310,
-    compression: mode === "timescale" ? 14.2 : 8.4,
-    p95: Math.max(5, Number((backend.performance.averageMs || base.p95).toFixed(1))),
-    bench: bench.length > 0 ? bench : base.bench,
-    queryIdx: 0,
+    ...next,
+    performance: next.performance ?? previous.performance,
+    performanceError:
+      next.performance !== null ? null : (next.performanceError ?? previous.performanceError),
   };
 }
 
-function Clock() {
-  const [now, setNow] = useState<string | null>(null);
-  useEffect(() => {
-    const f = () => setNow(new Date().toLocaleTimeString("es-ES", { hour12: false }));
-    f();
-    const id = setInterval(f, 1000);
-    return () => clearInterval(id);
-  }, []);
-  return <span className="text-foreground">{now ?? "--:--:--"}</span>;
+function Clock({ value }: { value: string | null }) {
+  return (
+    <span className="text-foreground">
+      {value ? new Date(value).toLocaleTimeString("es-ES", { hour12: false }) : "sin lecturas"}
+    </span>
+  );
 }
 
 function Dashboard() {
-  const [running, setRunning] = useState(true);
   const [range, setRange] = useState<Range>("5m");
   const [focus, setFocus] = useState(0);
   const [backendMode, setBackendMode] = useState<BackendMode>("timescale");
-  const [backendComparison, setBackendComparison] = useState<BackendComparison>({ timescale: null, plain: null });
-  const baseSimulation = useSimulation(running);
+  const [backendComparison, setBackendComparison] = useState<BackendComparison>({
+    timescale: emptySnapshot(),
+    plain: emptySnapshot(),
+  });
 
   useEffect(() => {
     let cancelled = false;
-    void (async () => {
-      const comparison = await fetchBackendComparison();
-      if (!cancelled) setBackendComparison(comparison);
-    })();
+    const refreshInProgress: Record<BackendMode, boolean> = { timescale: false, plain: false };
+    const pendingRefresh: Record<BackendMode, boolean> = { timescale: false, plain: false };
+    const refresh = async (mode: BackendMode, includePerformance: boolean) => {
+      if (refreshInProgress[mode]) {
+        pendingRefresh[mode] = true;
+        return;
+      }
+      refreshInProgress[mode] = true;
+      try {
+        const snapshot = await fetchBackendSnapshot(mode, range, includePerformance);
+        if (!cancelled) {
+          setBackendComparison((previous) => ({
+            ...previous,
+            [mode]: mergeSnapshot(previous[mode], snapshot),
+          }));
+        }
+      } finally {
+        refreshInProgress[mode] = false;
+        if (!cancelled && pendingRefresh[mode]) {
+          pendingRefresh[mode] = false;
+          void refresh(mode, false);
+        }
+      }
+    };
+
+    const streams = (Object.keys(BACKENDS) as BackendMode[]).map((mode) => {
+      void refresh(mode, true);
+      const stream = new EventSource(`${BACKENDS[mode]}/api/events`);
+      stream.addEventListener("readings-inserted", () => {
+        void refresh(mode, false);
+      });
+      return stream;
+    });
+    const benchmarkRefresh = window.setInterval(() => {
+      for (const mode of Object.keys(BACKENDS) as BackendMode[]) {
+        void refresh(mode, true);
+      }
+    }, 30000);
 
     return () => {
       cancelled = true;
+      window.clearInterval(benchmarkRefresh);
+      streams.forEach((stream) => stream.close());
     };
-  }, []);
+  }, [range]);
 
-  const activeBackend = backendMode === "timescale" ? backendComparison.timescale : backendComparison.plain;
-  const s = mergeWithBackendState(baseSimulation, activeBackend, backendMode);
-  const series = seriesFor(s, range);
-  const last = s.history[s.history.length - 1]!;
+  const activeSnapshot = backendComparison[backendMode];
   const otherBackendMode: BackendMode = backendMode === "timescale" ? "plain" : "timescale";
-  const otherBackendSnapshot = backendComparison[otherBackendMode];
-  const otherSeries = otherBackendSnapshot?.overview.length
-    ? DISTRICTS.map((district) => {
-        const row = otherBackendSnapshot.overview.find((item) => item.district === district);
-        const value = row ? row.avg_temperature : 0;
-        return { values: [value, value + 0.3, value + 0.7, value + 0.9, value + 0.5, value + 0.2], color: COLORS[0]! };
-      })
-    : DISTRICTS.map((district, idx) => ({
-        values: series.map((r) => r.temp[district]).slice(-6),
-        color: COLORS[idx % COLORS.length]!,
-      }));
+  const otherSnapshot = backendComparison[otherBackendMode];
+  const data = activeSnapshot.dashboard;
+  const otherData = otherSnapshot.dashboard;
+  const districts = useMemo(() => data?.overview.map((row) => row.district) ?? [], [data]);
+  const selectedDistrict = districts[Math.min(focus, Math.max(districts.length - 1, 0))] ?? "";
+
+  const districtSeries = useMemo(() => {
+    const rowsByDistrict = new Map<string, SeriesRow[]>();
+    for (const row of data?.series ?? []) {
+      const rows = rowsByDistrict.get(row.district) ?? [];
+      rows.push(row);
+      rowsByDistrict.set(row.district, rows);
+    }
+    return districts.map((district, index) => ({
+      label: district,
+      color: COLORS[index % COLORS.length]!,
+      values: (rowsByDistrict.get(district) ?? []).flatMap((row) =>
+        row.temperature === null ? [] : [row.temperature],
+      ),
+    }));
+  }, [data, districts]);
+
+  const otherDistrictSeries = useMemo(() => {
+    const rowsByDistrict = new Map<string, SeriesRow[]>();
+    for (const row of otherData?.series ?? []) {
+      const rows = rowsByDistrict.get(row.district) ?? [];
+      rows.push(row);
+      rowsByDistrict.set(row.district, rows);
+    }
+    return (otherData?.overview ?? []).map((row, index) => ({
+      label: row.district,
+      color: COLORS[index % COLORS.length]!,
+      values: (rowsByDistrict.get(row.district) ?? []).flatMap((sample) =>
+        sample.temperature === null ? [] : [sample.temperature],
+      ),
+    }));
+  }, [otherData]);
+
+  const lastDistrict = data?.overview.find((row) => row.district === selectedDistrict);
+  const selectedDistrictSeries =
+    data?.series.filter((row) => row.district === selectedDistrict) ?? [];
+  const selectedTemps = selectedDistrictSeries.flatMap((row) =>
+    row.temperature === null ? [] : [row.temperature],
+  );
+  const benchmarks = useMemo(() => {
+    const activeQueries = activeSnapshot.performance?.queries ?? [];
+    const otherQueries = otherSnapshot.performance?.queries ?? [];
+    const names = [...new Set([...activeQueries, ...otherQueries].map((query) => query.name))];
+    return names.flatMap((name) => {
+      const active = activeQueries.find((query) => query.name === name) ?? null;
+      const other = otherQueries.find((query) => query.name === name) ?? null;
+      return active || other ? [{ name, active, other }] : [];
+    });
+  }, [activeSnapshot.performance, otherSnapshot.performance]);
 
   return (
     <div className="relative min-h-screen bg-background text-foreground">
@@ -182,61 +305,75 @@ function Dashboard() {
         <aside className="hidden w-56 shrink-0 flex-col border-r bg-card/50 backdrop-blur-xl lg:flex">
           <div className="border-b px-5 py-5">
             <div className="flex items-center gap-2">
-              <span className="tick size-2 rounded-full bg-primary" />
+              <span className={`size-2 rounded-full ${data ? "tick bg-pos" : "bg-neg"}`} />
               <span className="font-display text-lg tracking-wide">PULSO</span>
               <span className="ml-auto font-mono text-[10px] text-dim">tsdb</span>
             </div>
-            <p className="mt-1 font-mono text-[10px] text-muted-foreground">sensores urbanos · tiempo real</p>
+            <p className="mt-1 font-mono text-[10px] text-muted-foreground">
+              lecturas desde la base de datos
+            </p>
           </div>
           <nav className="space-y-1 px-3 py-4 text-[13px]">
-            {NAV.map((n, i) => (
+            {NAV.map((item, index) => (
               <a
-                key={n}
+                key={item}
                 className={
-                  i === 0
+                  index === 0
                     ? "flex items-center gap-2.5 rounded-md bg-primary/10 px-3 py-2 font-medium text-primary"
                     : "flex cursor-pointer items-center gap-2.5 rounded-md px-3 py-2 text-muted-foreground hover:bg-secondary hover:text-foreground"
                 }
               >
-                <span className={`size-1.5 rounded-full ${i === 0 ? "bg-primary" : "bg-dim"}`} />
-                {n}
+                <span
+                  className={`size-1.5 rounded-full ${index === 0 ? "bg-primary" : "bg-dim"}`}
+                />
+                {item}
               </a>
             ))}
           </nav>
           <div className="mx-3 mt-2 panel p-3">
-            <p className="font-mono text-[10px] uppercase tracking-wider text-dim">Barrios</p>
-            <ul className="mt-2 space-y-1.5 font-mono text-[11px]">
-              {DISTRICTS.map((d, i) => (
-                <li key={d} className="flex items-center gap-2">
-                  <span className="size-1.5 rounded-full" style={{ background: COLORS[i] }} />
-                  <span className="text-muted-foreground">{d}</span>
-                  <span className="ml-auto tabular-nums">{last.temp[d].toFixed(1)}°</span>
-                </li>
-              ))}
-            </ul>
+            <p className="font-mono text-[10px] uppercase tracking-wider text-dim">
+              Barrios · promedio 5 min
+            </p>
+            {districts.length === 0 ? (
+              <p className="mt-2 font-mono text-[11px] text-dim">Sin datos en la base</p>
+            ) : (
+              <ul className="mt-2 space-y-1.5 font-mono text-[11px]">
+                {data?.overview.map((row, index) => (
+                  <li key={row.district} className="flex items-center gap-2">
+                    <span
+                      className="size-1.5 rounded-full"
+                      style={{ background: COLORS[index % COLORS.length] }}
+                    />
+                    <span className="text-muted-foreground">{row.district}</span>
+                    <span className="ml-auto tabular-nums">
+                      {row.avg_temperature === null ? "—" : `${row.avg_temperature.toFixed(1)}°`}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            )}
           </div>
           <div className="mt-auto border-t px-5 py-4">
-            <p className="font-mono text-[10px] text-dim">SIMULADOR</p>
-            <p className={`mt-1 flex items-center gap-2 font-mono text-[11px] ${running ? "text-pos" : "text-warn"}`}>
-              <span className={`size-1.5 rounded-full ${running ? "tick bg-pos" : "bg-warn"}`} />
-              {running ? "EN VIVO · 1 tick/s" : "EN PAUSA"}
+            <p className="font-mono text-[10px] text-dim">FUENTE ACTIVA</p>
+            <p
+              className={`mt-1 flex items-center gap-2 font-mono text-[11px] ${data ? "text-pos" : "text-neg"}`}
+            >
+              <span className={`size-1.5 rounded-full ${data ? "tick bg-pos" : "bg-neg"}`} />
+              {data?.database ?? (activeSnapshot.error ? "SIN CONEXIÓN" : "CONECTANDO")}
             </p>
-            <p className="mt-1 font-mono text-[10px] text-dim">{fmt(SENSORS)} sensores activos</p>
+            {activeSnapshot.error && (
+              <p className="mt-1 break-words font-mono text-[10px] text-neg">
+                {activeSnapshot.error}
+              </p>
+            )}
           </div>
         </aside>
 
         <main className="min-w-0 flex-1">
           <header className="sticky top-0 z-20 border-b bg-background/70 backdrop-blur-xl">
             <div className="flex flex-wrap items-center gap-4 px-5 py-3">
-              <button
-                onClick={() => setRunning((r) => !r)}
-                className="flex items-center gap-2 rounded-md border px-2.5 py-1 font-mono text-[11px] text-muted-foreground hover:text-foreground"
-              >
-                <span className={`size-2 rounded-full ${running ? "tick bg-primary" : "bg-warn"}`} />
-                {running ? "EN VIVO — pausar" : "PAUSADO — reanudar"}
-              </button>
-              <div className="hidden font-mono text-[11px] text-dim md:block">
-                última inserción <Clock />
+              <div className="font-mono text-[11px] text-dim">
+                última lectura en la base <Clock value={data?.stats.lastReadingAt ?? null} />
               </div>
               <div className="ml-auto flex flex-wrap items-center gap-2">
                 <div className="flex items-center gap-1 rounded-md border bg-card/60 p-0.5 font-mono text-[11px]">
@@ -251,13 +388,13 @@ function Dashboard() {
                   ))}
                 </div>
                 <div className="flex items-center gap-1 rounded-md border bg-card/60 p-0.5 font-mono text-[11px]">
-                  {(Object.keys(RANGES) as Range[]).map((r) => (
+                  {(Object.keys(RANGES) as Range[]).map((item) => (
                     <button
-                      key={r}
-                      onClick={() => setRange(r)}
-                      className={`rounded px-2.5 py-1 ${r === range ? "bg-primary/15 text-primary" : "text-dim hover:text-foreground"}`}
+                      key={item}
+                      onClick={() => setRange(item)}
+                      className={`rounded px-2.5 py-1 ${item === range ? "bg-primary/15 text-primary" : "text-dim hover:text-foreground"}`}
                     >
-                      {r}
+                      {item}
                     </button>
                   ))}
                 </div>
@@ -266,72 +403,120 @@ function Dashboard() {
           </header>
 
           <div className="space-y-4 px-5 py-5">
-            <StatStrip s={s} />
+            {!data && <DatabaseMessage error={activeSnapshot.error} />}
+            {data && (
+              <>
+                <section className="rise panel overflow-hidden" style={{ animationDelay: "240ms" }}>
+                  <div className="flex flex-wrap items-center gap-3 border-b px-4 py-3">
+                    <h2 className="font-display text-lg tracking-wide">Temperatura por barrio</h2>
+                    <span className="font-mono text-[10px] text-dim">
+                      °C · bucket {RANGES[range]} · ventana {range}
+                    </span>
+                    <div className="ml-auto flex flex-wrap items-center gap-3 font-mono text-[10px]">
+                      {districts.map((district, index) => (
+                        <button
+                          key={district}
+                          onClick={() => setFocus(index)}
+                          className={`flex items-center gap-1.5 ${focus === index ? "text-foreground" : "text-muted-foreground"}`}
+                        >
+                          <span
+                            className="size-1.5 rounded-full"
+                            style={{ background: COLORS[index % COLORS.length] }}
+                          />
+                          {district}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="grid gap-4 p-3 xl:grid-cols-[minmax(0,1.75fr)_minmax(190px,0.55fr)]">
+                    <div className="relative h-64">
+                      {districtSeries.some((line) => line.values.length > 0) ? (
+                        <LineChart series={districtSeries} />
+                      ) : (
+                        <EmptyState text="No hay lecturas de temperatura en este intervalo." />
+                      )}
+                      <div className="absolute right-4 top-3 font-mono text-[10px] text-primary">
+                        {formatNumber(data.series.length)} registros agregados desde la base
+                      </div>
+                    </div>
+                    <div className="flex h-64 flex-col rounded-md border border-border/70 bg-card/35 p-2">
+                      <div className="mb-2 flex items-center justify-between px-1 pt-1">
+                        <span className="font-mono text-[10px] uppercase tracking-wider text-dim">
+                          {otherData?.database ??
+                            (otherSnapshot.error ? "Base no disponible" : "Conectando…")}
+                        </span>
+                        <span className="font-mono text-[9px] text-muted-foreground">
+                          comparación
+                        </span>
+                      </div>
+                      <div className="flex-1">
+                        {otherData && otherDistrictSeries.some((line) => line.values.length > 0) ? (
+                          <LineChart series={otherDistrictSeries} height={150} />
+                        ) : (
+                          <EmptyState
+                            text={otherSnapshot.error ?? "Esperando lecturas de la otra base."}
+                          />
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                </section>
 
-            <section className="rise panel overflow-hidden" style={{ animationDelay: "240ms" }}>
-              <div className="flex flex-wrap items-center gap-3 border-b px-4 py-3">
-                <h2 className="font-display text-lg tracking-wide">Temperatura por barrio</h2>
-                <span className="font-mono text-[10px] text-dim">
-                  °C · time_bucket {RANGES[range].label} · ventana {range}
-                </span>
-                <div className="ml-auto flex flex-wrap items-center gap-3 font-mono text-[10px]">
-                  {DISTRICTS.map((d, i) => (
-                    <button
-                      key={d}
-                      onClick={() => setFocus(i)}
-                      className={`flex items-center gap-1.5 ${focus === i ? "text-foreground" : "text-muted-foreground"}`}
-                    >
-                      <span className="size-1.5 rounded-full" style={{ background: COLORS[i] }} />
-                      {d}
-                    </button>
-                  ))}
-                </div>
-              </div>
-              <div className="grid gap-4 p-3 xl:grid-cols-[minmax(0,1.75fr)_minmax(190px,0.55fr)]">
-                <div className="relative h-64">
-                  <LineChart
-                    series={DISTRICTS.map((d, i) => ({
-                      values: series.map((r) => r.temp[d]),
-                      color: COLORS[i]!,
-                    }))}
+                <section className="grid grid-cols-2 gap-3 xl:grid-cols-4">
+                  {(
+                    [
+                      ["Humedad media", "humidity", "%", "var(--chart-2)"],
+                      ["CPU media", "cpu", "%", "var(--chart-3)"],
+                      ["Memoria media", "memory", "%", "var(--chart-5)"],
+                      ["Red media", "network", "Mbps", "var(--chart-6)"],
+                    ] as const
+                  ).map(([title, metric, unit, color], index) => {
+                    const value = overviewAverage(data.overview, metric);
+                    const values = aggregateSeries(data.series, metric);
+                    return (
+                      <MetricCard
+                        key={metric}
+                        title={title}
+                        unit={unit}
+                        value={value}
+                        values={values}
+                        color={color}
+                        delay={280 + index * 40}
+                      />
+                    );
+                  })}
+                </section>
+
+                <section className="grid grid-cols-12 gap-4">
+                  <Drilldown
+                    district={selectedDistrict}
+                    overview={lastDistrict}
+                    values={selectedTemps}
+                    range={range}
+                    focus={focus}
                   />
-                  <div className="absolute right-4 top-3 font-mono text-[10px] text-primary">
-                    {fmt(series.length)} buckets · {fmt(series.length * SENSORS)} lecturas
-                  </div>
-                </div>
+                  <QueryConsole
+                    queries={benchmarks}
+                    mode={backendMode}
+                    otherMode={otherBackendMode}
+                    performanceError={activeSnapshot.performanceError}
+                  />
+                </section>
 
-                <div className="flex h-64 flex-col rounded-md border border-border/70 bg-card/35 p-2">
-                  <div className="mb-2 flex items-center justify-between px-1 pt-1">
-                    <span className="font-mono text-[10px] uppercase tracking-wider text-dim">{otherBackendMode === "timescale" ? "TimescaleDB" : "PostgreSQL"}</span>
-                    <span className="font-mono text-[9px] text-muted-foreground">mini</span>
-                  </div>
-                  <div className="flex-1">
-                    <LineChart series={otherSeries} height={150} />
-                  </div>
-                </div>
-              </div>
-            </section>
-
-            <section className="grid grid-cols-2 gap-3 xl:grid-cols-4">
-              <MetricCard title="Humedad media" unit="%" value={last.humidity.toFixed(1)} values={series.map((r) => r.humidity)} color="var(--chart-2)" delay={280} />
-              <MetricCard title="Calidad del aire" unit="AQI" value={String(last.aqi)} values={series.map((r) => r.aqi)} color={last.aqi > 100 ? "var(--neg)" : "var(--chart-3)"} delay={320} alert={last.aqi > 100} />
-              <MetricCard title="Consumo eléctrico" unit="MW" value={last.energy.toFixed(1)} values={series.map((r) => r.energy)} color="var(--chart-5)" delay={360} />
-              <MetricCard title="Ruido urbano" unit="dB" value={last.noise.toFixed(1)} values={series.map((r) => r.noise)} color="var(--chart-6)" delay={400} />
-            </section>
-
-            <section className="grid grid-cols-12 gap-4">
-              <Drilldown s={s} focus={focus} range={range} />
-              <QueryConsole s={s} range={range} />
-            </section>
-
-            <section className="grid grid-cols-12 gap-4">
-              <Heatmap s={s} />
-              <Feed s={s} />
-            </section>
+                <section className="grid grid-cols-12 gap-4">
+                  <Heatmap data={data} />
+                  <Feed data={data} />
+                </section>
+              </>
+            )}
 
             <footer className="flex flex-wrap justify-between gap-2 border-t pt-4 font-mono text-[10px] text-dim">
-              <span>PULSO · demo de rendimiento TimescaleDB · datos simulados por tareas programadas</span>
-              <span>{fmt(s.totalRows)} filas en hipertabla readings</span>
+              <span>PULSO · lecturas y agregados consultados desde las bases configuradas</span>
+              <span>
+                {data
+                  ? `${data.database} · transmisión en vivo`
+                  : "sin datos de la base seleccionada"}
+              </span>
             </footer>
           </div>
         </main>
@@ -340,181 +525,353 @@ function Dashboard() {
   );
 }
 
-function StatStrip({ s }: { s: SimState }) {
-  const items = [
-    { k: "Filas / seg", v: fmt(s.ingest), sub: `${fmt(SENSORS)} sensores × 4 métricas`, d: "▲ ingesta", pos: true },
-    { k: "Filas totales", v: `${(s.totalRows / 1e9).toFixed(3)} B`, sub: `${fmt(s.chunks)} chunks · 1 día/chunk`, d: "▲ creciendo", pos: true },
-    { k: "Compresión", v: `${s.compression.toFixed(1)}×`, sub: "1,9 TB → 134 GB", d: "columnar", pos: true },
-    { k: "Latencia p95", v: `${s.p95.toFixed(1)} ms`, sub: "consultas de agregación", d: s.p95 > 12 ? "▲ carga" : "▼ estable", pos: s.p95 <= 12 },
-  ];
+function DatabaseMessage({ error }: { error: string | null }) {
   return (
-    <section className="grid grid-cols-2 gap-3 md:grid-cols-4">
-      {items.map((it, i) => (
-        <div key={it.k} className="rise panel p-4" style={{ animationDelay: `${i * 60}ms` }}>
-          <div className="flex items-center justify-between">
-            <span className="font-mono text-[10px] uppercase tracking-wider text-dim">{it.k}</span>
-            <span className={`font-mono text-[10px] ${it.pos ? "text-pos" : "text-neg"}`}>{it.d}</span>
-          </div>
-          <div key={it.v} className="flash mt-2 font-mono text-2xl tabular-nums">{it.v}</div>
-          <div className="mt-1 font-mono text-[10px] text-dim">{it.sub}</div>
-        </div>
-      ))}
-    </section>
+    <div className="panel p-6 font-mono text-sm">
+      <p className="text-neg">
+        {error
+          ? `No se pudieron consultar los datos: ${error}`
+          : "Conectando con la base de datos…"}
+      </p>
+      {error && (
+        <p className="mt-2 text-dim">
+          No se muestran datos de ejemplo. Comprueba que Docker Compose y la API estén en ejecución.
+        </p>
+      )}
+    </div>
   );
 }
 
-function MetricCard({ title, unit, value, values, color, delay, alert }: { title: string; unit: string; value: string; values: number[]; color: string; delay: number; alert?: boolean }) {
+function EmptyState({ text }: { text: string }) {
+  return (
+    <div className="flex h-full items-center justify-center px-4 text-center font-mono text-[11px] text-dim">
+      {text}
+    </div>
+  );
+}
+
+function aggregateSeries(rows: SeriesRow[], metric: MetricKey) {
+  const buckets = new Map<string, { weightedSum: number; count: number }>();
+  for (const row of rows) {
+    const value = row[metric];
+    const count = row[`${metric}_samples`];
+    if (value === null || count === 0) continue;
+    const aggregate = buckets.get(row.bucket) ?? { weightedSum: 0, count: 0 };
+    aggregate.weightedSum += value * count;
+    aggregate.count += count;
+    buckets.set(row.bucket, aggregate);
+  }
+  return [...buckets.values()].map((item) => item.weightedSum / item.count);
+}
+
+function overviewAverage(rows: OverviewRow[], metric: Exclude<MetricKey, "temperature">) {
+  const samplesKey = `${metric}_samples` as const;
+  const totalSamples = rows.reduce((sum, row) => sum + row[samplesKey], 0);
+  if (totalSamples === 0) return null;
+  return (
+    rows.reduce((sum, row) => sum + (row[`avg_${metric}`] ?? 0) * row[samplesKey], 0) / totalSamples
+  );
+}
+
+function MetricCard({
+  title,
+  unit,
+  value,
+  values,
+  color,
+  delay,
+}: {
+  title: string;
+  unit: string;
+  value: number | null;
+  values: number[];
+  color: string;
+  delay: number;
+}) {
   return (
     <div className="rise panel overflow-hidden" style={{ animationDelay: `${delay}ms` }}>
-      <div className="flex items-center justify-between px-4 pt-3">
-        <span className="font-mono text-[10px] uppercase tracking-wider text-dim">{title}</span>
-        {alert && <span className="tick rounded bg-neg/15 px-1.5 py-0.5 font-mono text-[9px] text-neg">ALERTA</span>}
+      <div className="px-4 pt-3 font-mono text-[10px] uppercase tracking-wider text-dim">
+        {title}
       </div>
       <div className="flex items-baseline gap-1 px-4 pt-1">
-        <span className="font-mono text-xl tabular-nums">{value}</span>
+        <span className="font-mono text-xl tabular-nums">
+          {value === null || Number.isNaN(value) ? "—" : value.toFixed(1)}
+        </span>
         <span className="font-mono text-[10px] text-muted-foreground">{unit}</span>
       </div>
       <div className="h-14">
-        <Sparkline values={values} color={color} />
+        {values.length > 0 ? (
+          <Sparkline values={values} color={color} />
+        ) : (
+          <EmptyState text="Sin lecturas" />
+        )}
       </div>
     </div>
   );
 }
 
-function Drilldown({ s, focus, range }: { s: SimState; focus: number; range: Range }) {
-  const d = DISTRICTS[focus]!;
-  const series = seriesFor(s, range).map((r) => r.temp[d]);
-  const size = Math.max(1, Math.floor(series.length / 16));
+function Drilldown({
+  district,
+  overview,
+  values,
+  range,
+  focus,
+}: {
+  district: string;
+  overview: OverviewRow | undefined;
+  values: number[];
+  range: Range;
+  focus: number;
+}) {
+  const size = Math.max(1, Math.floor(values.length / 16));
   const buckets: number[] = [];
-  for (let i = 0; i + size <= series.length; i += size) {
-    const chunk = series.slice(i, i + size);
-    buckets.push(chunk.reduce((a, b) => a + b, 0) / chunk.length);
+  for (let i = 0; i + size <= values.length; i += size) {
+    const group = values.slice(i, i + size);
+    buckets.push(group.reduce((sum, value) => sum + value, 0) / group.length);
   }
-  const b = buckets.slice(-16);
-  const avg = series.reduce((a, x) => a + x, 0) / series.length;
+  const average = overview?.avg_temperature;
   return (
     <div className="rise panel col-span-12 lg:col-span-5" style={{ animationDelay: "300ms" }}>
       <div className="flex items-center gap-2 border-b px-4 py-3">
-        <h3 className="font-display text-base tracking-wide">Detalle · {d}</h3>
-        <span className="ml-auto font-mono text-[10px] text-dim">avg() · 16 buckets</span>
+        <h3 className="font-display text-base tracking-wide">
+          Detalle · {district || "sin barrio"}
+        </h3>
+        <span className="ml-auto font-mono text-[10px] text-dim">temperatura leída de la base</span>
       </div>
       <div className="p-4">
         <div className="h-28">
-          <Bars values={b} color={COLORS[focus]!} />
+          {buckets.length > 0 ? (
+            <Bars values={buckets} color={COLORS[focus % COLORS.length]!} />
+          ) : (
+            <EmptyState text="Sin temperaturas para mostrar." />
+          )}
         </div>
         <div className="mt-2 flex justify-between font-mono text-[9px] text-dim">
           <span>-{range}</span>
-          <span>ahora</span>
+          <span>último bucket</span>
         </div>
         <div className="mt-4 grid grid-cols-3 gap-2 font-mono text-[11px]">
-          <div><p className="text-[10px] text-dim">media</p><p className="tabular-nums">{avg.toFixed(2)} °C</p></div>
-          <div><p className="text-[10px] text-dim">máx</p><p className="tabular-nums">{Math.max(...series).toFixed(2)} °C</p></div>
-          <div><p className="text-[10px] text-dim">mín</p><p className="tabular-nums">{Math.min(...series).toFixed(2)} °C</p></div>
+          <div>
+            <p className="text-[10px] text-dim">media 5 min</p>
+            <p className="tabular-nums">
+              {average === null || average === undefined ? "—" : `${average.toFixed(2)} °C`}
+            </p>
+          </div>
+          <div>
+            <p className="text-[10px] text-dim">máx intervalo</p>
+            <p className="tabular-nums">
+              {values.length ? `${Math.max(...values).toFixed(2)} °C` : "—"}
+            </p>
+          </div>
+          <div>
+            <p className="text-[10px] text-dim">mín intervalo</p>
+            <p className="tabular-nums">
+              {values.length ? `${Math.min(...values).toFixed(2)} °C` : "—"}
+            </p>
+          </div>
         </div>
-        <p className="mt-3 font-mono text-[10px] text-dim">Pulsa un barrio en la gráfica principal para ver su detalle.</p>
       </div>
     </div>
   );
 }
 
-function QueryConsole({ s, range }: { s: SimState; range: Range }) {
-  const q = s.bench[s.queryIdx]!;
-  const sql = q.sql.replace("{bucket}", RANGES[range].bucket).replace("{interval}", RANGES[range].interval);
-  const speed = q.pg / q.tsdb;
+function QueryConsole({
+  queries,
+  mode,
+  otherMode,
+  performanceError,
+}: {
+  queries: { name: string; active: QueryResult | null; other: QueryResult | null }[];
+  mode: BackendMode;
+  otherMode: BackendMode;
+  performanceError: string | null;
+}) {
   return (
     <div className="rise panel col-span-12 lg:col-span-7" style={{ animationDelay: "360ms" }}>
       <div className="flex items-center gap-2 border-b px-4 py-3">
         <h3 className="font-display text-base tracking-wide">Consola de consultas</h3>
-        <span className="ml-auto font-mono text-[10px] text-dim">TimescaleDB vs PostgreSQL</span>
+        <span className="ml-auto font-mono text-[10px] text-dim">
+          Ejecución medida por cada base (EXPLAIN ANALYZE)
+        </span>
       </div>
-      <div className="p-4 font-mono text-[12px] leading-relaxed">
-        <div className="mb-2 flex gap-1">
-          {s.bench.map((b, i) => (
-            <span key={b.title} className={`h-1 flex-1 rounded-full ${i === s.queryIdx ? "bg-primary" : "bg-border"}`} />
-          ))}
+      {queries.length === 0 ? (
+        <EmptyState
+          text={
+            performanceError
+              ? `No se pudieron medir las consultas: ${performanceError}`
+              : "Sin resultados de consulta disponibles."
+          }
+        />
+      ) : (
+        <div className="space-y-3 p-4">
+          {queries.map(({ name, active, other }) => {
+            const title = active?.title ?? other?.title ?? name;
+            const maxMs = Math.max(active?.ms ?? 0, other?.ms ?? 0);
+            return (
+              <section key={name} className="rounded-md border border-border/70 bg-card/30 p-3">
+                <h4 className="mb-3 font-mono text-[11px] text-dim">{title}</h4>
+                <div className="grid gap-3 xl:grid-cols-2">
+                  <QuerySide
+                    label={mode === "timescale" ? "TimescaleDB" : "PostgreSQL"}
+                    query={active}
+                    maxMs={maxMs}
+                  />
+                  <QuerySide
+                    label={otherMode === "timescale" ? "TimescaleDB" : "PostgreSQL"}
+                    query={other}
+                    maxMs={maxMs}
+                  />
+                </div>
+              </section>
+            );
+          })}
         </div>
-        <p className="text-dim">-- {q.title} · escanea {q.rows} filas</p>
-        <pre key={s.queryIdx} className="slidein whitespace-pre-wrap text-foreground">{sql}</pre>
-        <div className="mt-4 space-y-2">
-          <BenchRow label="TimescaleDB" ms={q.tsdb} pct={(q.tsdb / q.pg) * 100} tone="pos" />
-          <BenchRow label="PostgreSQL" ms={q.pg} pct={100} tone="neg" />
-        </div>
-        <p className="mt-3 text-[10px] text-dim">
-          aceleración <span className="text-pos">{speed.toFixed(0)}×</span> · compresión <span className="text-pos">{s.compression.toFixed(1)}×</span> · chunk exclusion activo
-        </p>
-      </div>
+      )}
     </div>
   );
 }
 
-function BenchRow({ label, ms, pct, tone }: { label: string; ms: number; pct: number; tone: "pos" | "neg" }) {
+function QuerySide({
+  label,
+  query,
+  maxMs,
+}: {
+  label: string;
+  query: QueryResult | null;
+  maxMs: number;
+}) {
   return (
-    <div className="flex items-center gap-3">
-      <span className="w-24 shrink-0 text-[10px] text-muted-foreground">{label}</span>
-      <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-border/60">
-        <div className={`h-full rounded-full transition-[width] duration-500 ${tone === "pos" ? "bg-pos" : "bg-neg/70"}`} style={{ width: `${Math.max(2, pct)}%` }} />
+    <div className="min-w-0">
+      <div className="mb-1 flex items-center justify-between gap-2 font-mono text-[10px]">
+        <span className="text-muted-foreground">{label}</span>
+        <span className="text-dim">
+          {query ? `${formatNumber(query.rows)} filas` : "sin medición"}
+        </span>
       </div>
-      <span className={`w-20 text-right tabular-nums ${tone === "pos" ? "text-pos" : "text-neg"}`}>
-        {ms >= 1000 ? `${(ms / 1000).toFixed(2)} s` : `${ms} ms`}
-      </span>
+      {query ? (
+        <>
+          <pre className="max-h-28 overflow-auto whitespace-pre-wrap break-words rounded bg-background/70 p-2 font-mono text-[10px] leading-relaxed text-foreground">
+            {query.sql}
+          </pre>
+          <div className="mt-2 flex items-center gap-2">
+            <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-border/60">
+              <div
+                className="h-full rounded-full bg-primary"
+                style={{ width: `${Math.max(2, (query.ms / (maxMs || 1)) * 100)}%` }}
+              />
+            </div>
+            <span className="w-20 text-right font-mono text-[10px] tabular-nums">
+              {query.ms >= 1000 ? `${(query.ms / 1000).toFixed(2)} s` : `${query.ms} ms`}
+            </span>
+          </div>
+        </>
+      ) : (
+        <p className="rounded bg-background/70 p-2 font-mono text-[10px] text-dim">
+          No se recibieron datos de esta consulta.
+        </p>
+      )}
     </div>
   );
 }
 
-function Heatmap({ s }: { s: SimState }) {
-  const all = s.heat.flat();
-  const min = Math.min(...all);
-  const max = Math.max(...all);
+function Heatmap({ data }: { data: DashboardData }) {
+  const values = data.heatmap.flatMap((item) =>
+    item.temperature === null ? [] : [item.temperature],
+  );
+  const min = values.length ? Math.min(...values) : 0;
+  const max = values.length ? Math.max(...values) : 0;
+  const districts = data.overview.map((row) => row.district);
+  const currentMinute = Math.floor(Date.now() / 60000) * 60000;
+  const bucketTimes = Array.from({ length: 5 }, (_, index) => currentMinute - (4 - index) * 60000);
   return (
     <div className="rise panel col-span-12 lg:col-span-8" style={{ animationDelay: "420ms" }}>
       <div className="flex items-center gap-2 border-b px-4 py-3">
-        <h3 className="font-display text-base tracking-wide">Mapa de calor · últimas 24 h</h3>
-        <span className="ml-auto font-mono text-[10px] text-dim">agregado continuo temp_hourly</span>
+        <h3 className="font-display text-base tracking-wide">Mapa de calor · últimos 5 min</h3>
+        <span className="ml-auto font-mono text-[10px] text-dim">
+          promedios por minuto consultados en la base
+        </span>
       </div>
-      <div className="overflow-x-auto p-4">
-        <div className="min-w-[560px] space-y-1">
-          {DISTRICTS.map((d, di) => (
-            <div key={d} className="flex items-center gap-2">
-              <span className="w-14 shrink-0 font-mono text-[10px] text-muted-foreground">{d}</span>
-              <div className="grid flex-1 grid-cols-24 gap-[2px]" style={{ gridTemplateColumns: "repeat(24, minmax(0, 1fr))" }}>
-                {s.heat[di]!.map((v, h) => {
-                  const t = (v - min) / (max - min || 1);
-                  return (
-                    <div
-                      key={h}
-                      title={`${d} ${h}:00 · ${v} °C`}
-                      className="h-6 rounded-[2px]"
-                      style={{ background: `color-mix(in oklab, var(--chart-4) ${Math.round(t * 100)}%, var(--info))`, opacity: 0.35 + t * 0.65 }}
-                    />
-                  );
-                })}
+      {values.length === 0 ? (
+        <EmptyState text="No hay lecturas de temperatura en los últimos 5 minutos." />
+      ) : (
+        <div className="overflow-x-auto p-4">
+          <div className="min-w-[560px] space-y-1">
+            {districts.map((district) => (
+              <div key={district} className="flex items-center gap-2">
+                <span className="w-14 shrink-0 font-mono text-[10px] text-muted-foreground">
+                  {district}
+                </span>
+                <div
+                  className="grid flex-1 gap-[2px]"
+                  style={{ gridTemplateColumns: "repeat(5, minmax(0, 1fr))" }}
+                >
+                  {bucketTimes.map((bucket) => {
+                    const cell = data.heatmap.find(
+                      (item) => item.district === district && item.bucket === bucket,
+                    );
+                    const temperature = cell?.temperature ?? null;
+                    const ratio = temperature === null ? 0 : (temperature - min) / (max - min || 1);
+                    const time = new Date(bucket).toLocaleTimeString("es-ES", {
+                      hour: "2-digit",
+                      minute: "2-digit",
+                    });
+                    return (
+                      <div
+                        key={bucket}
+                        title={
+                          temperature === null
+                            ? `${district} ${time} · sin lecturas`
+                            : `${district} ${time} · ${temperature.toFixed(1)} °C · ${formatNumber(cell?.samples ?? 0)} muestras`
+                        }
+                        className={`h-6 rounded-[2px] ${temperature === null ? "bg-border/40" : ""}`}
+                        style={
+                          temperature === null
+                            ? undefined
+                            : {
+                                background: `color-mix(in oklab, var(--chart-4) ${Math.round(ratio * 100)}%, var(--info))`,
+                                opacity: 0.35 + ratio * 0.65,
+                              }
+                        }
+                      />
+                    );
+                  })}
+                </div>
+              </div>
+            ))}
+            <div className="flex gap-2 pl-16 font-mono text-[9px] text-dim">
+              <div className="flex flex-1 justify-between">
+                <span>−4 min</span>
+                <span>−2 min</span>
+                <span>ahora</span>
               </div>
             </div>
-          ))}
-          <div className="flex gap-2 pl-16 font-mono text-[9px] text-dim">
-            <div className="flex flex-1 justify-between"><span>00h</span><span>06h</span><span>12h</span><span>18h</span><span>23h</span></div>
           </div>
         </div>
-      </div>
+      )}
     </div>
   );
 }
 
-function Feed({ s }: { s: SimState }) {
+function Feed({ data }: { data: DashboardData }) {
   return (
     <div className="rise panel col-span-12 lg:col-span-4" style={{ animationDelay: "480ms" }}>
       <div className="flex items-center gap-2 border-b px-4 py-3">
-        <h3 className="font-display text-base tracking-wide">Inserciones en vivo</h3>
-        <span className="tick ml-auto size-1.5 rounded-full bg-primary" />
+        <h3 className="font-display text-base tracking-wide">Últimas lecturas</h3>
+        <span className="ml-auto font-mono text-[9px] text-dim">{data.database}</span>
       </div>
-      <ul className="h-[228px] overflow-hidden px-4 py-2 font-mono text-[11px]">
-        {s.feed.length === 0 && <li className="py-2 text-dim">Esperando datos…</li>}
-        {s.feed.map((f) => (
-          <li key={f.id} className="slidein flex items-center gap-2 border-b border-border/40 py-1.5">
-            <span className="text-primary">INSERT</span>
-            <span className="text-muted-foreground">{f.sensor}</span>
-            <span className="text-dim">{f.metric}</span>
-            <span className="ml-auto tabular-nums">{f.value}</span>
+      <ul className="h-[228px] overflow-auto px-4 py-2 font-mono text-[11px]">
+        {data.feed.length === 0 && (
+          <li className="py-2 text-dim">La base todavía no contiene lecturas.</li>
+        )}
+        {data.feed.map((row, index) => (
+          <li
+            key={`${row.ts}-${row.sensor_id}-${row.metric}-${index}`}
+            className="flex items-center gap-2 border-b border-border/40 py-1.5"
+          >
+            <span className="text-primary">{row.metric}</span>
+            <span className="text-muted-foreground">{row.sensor_id}</span>
+            <span className="text-dim">{row.district}</span>
+            <span className="ml-auto tabular-nums">{formatNumber(row.value, 2)}</span>
           </li>
         ))}
       </ul>
