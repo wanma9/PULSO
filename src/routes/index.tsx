@@ -41,6 +41,7 @@ type QueryResult = { name: string; title: string; ms: number; rows: number };
 type BackendSnapshot = {
   overview: OverviewRow[];
   performance: { averageMs: number; queries: QueryResult[] };
+  performanceError: string | null;
   fetchedAt: string;
 };
 type BackendState = { snapshot: BackendSnapshot | null; error: string | null };
@@ -60,22 +61,27 @@ async function fetchBackend(mode: BackendMode, benchmarkAt: string): Promise<Bac
       { signal: AbortSignal.timeout(30_000) },
     ),
   ]);
-  if (!overviewRes.ok || !performanceRes.ok) {
-    const failedResponse = !performanceRes.ok ? performanceRes : overviewRes;
-    if (failedResponse.headers.get("content-type")?.includes("application/json")) {
-      const payload = (await failedResponse.json()) as { error?: unknown };
-      if (typeof payload.error === "string") {
-        throw new Error(payload.error);
-      }
-    }
-    throw new Error(`La API respondió con error (${overviewRes.status}/${performanceRes.status})`);
+  if (!overviewRes.ok) {
+    throw new Error(`La API respondió con error (${overviewRes.status})`);
   }
 
   const overview = (await overviewRes.json()) as { data?: Array<Record<string, unknown>> };
-  const performance = (await performanceRes.json()) as {
-    averageMs?: number;
-    queries?: QueryResult[];
-  };
+  let performance: { averageMs?: number; queries?: QueryResult[] } = {};
+  let performanceError: string | null = null;
+  if (performanceRes.ok) {
+    performance = (await performanceRes.json()) as {
+      averageMs?: number;
+      queries?: QueryResult[];
+    };
+  } else {
+    const payload = performanceRes.headers.get("content-type")?.includes("application/json")
+      ? ((await performanceRes.json()) as { error?: unknown })
+      : null;
+    performanceError =
+      typeof payload?.error === "string"
+        ? payload.error
+        : `El benchmark respondió con error (${performanceRes.status})`;
+  }
 
   return {
     overview: (overview.data ?? []).map((row) => ({
@@ -89,6 +95,7 @@ async function fetchBackend(mode: BackendMode, benchmarkAt: string): Promise<Bac
       averageMs: Number(performance.averageMs ?? 0),
       queries: performance.queries ?? [],
     },
+    performanceError,
     fetchedAt: new Date().toLocaleTimeString("es-ES", { hour12: false }),
   };
 }
@@ -444,8 +451,8 @@ function BackendPanel({
                 ))}
               </ul>
             ) : (
-              <p className="py-3 text-sm text-muted-foreground">
-                La API no devolvió resultados para estas consultas.
+              <p className={`py-3 text-sm ${snapshot.performanceError ? "text-warn" : "text-muted-foreground"}`}>
+                {snapshot.performanceError ?? "La API no devolvió resultados para estas consultas."}
               </p>
             )}
           </div>
