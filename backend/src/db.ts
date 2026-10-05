@@ -166,11 +166,32 @@ export async function ensureSchema() {
       GROUP BY bucket, district
       WITH DATA;
     `);
-
-    for (const view of [
-      "shared_telemetry_1s",
-      "shared_peaks_1m",
-      "shared_energy_2s",
+    await pool.query(`
+      CREATE MATERIALIZED VIEW IF NOT EXISTS shared_sensor_telemetry_1s
+      WITH (timescaledb.continuous) AS
+      SELECT
+        time_bucket('1 second', ts, TIMESTAMPTZ '2000-01-01 00:00:00+00') AS bucket,
+        district,
+        sensor_id,
+        AVG(temperature) AS avg_temperature,
+        MAX(cpu) AS peak_cpu,
+        AVG(network) AS avg_network,
+        SUM(energy_kwh) AS energy_kwh
+      FROM sensor_readings
+      WHERE metric = 'telemetry' AND source = 'shared-simulator'
+      GROUP BY bucket, district, sensor_id
+      WITH DATA;
+    `);
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS shared_sensor_telemetry_1s_benchmark_idx
+      ON shared_sensor_telemetry_1s (bucket, district, sensor_id)
+      INCLUDE (avg_temperature, peak_cpu, avg_network, energy_kwh);
+    `);
+    for (const { name: view, endOffset } of [
+      { name: "shared_telemetry_1s", endOffset: "2 minutes" },
+      { name: "shared_peaks_1m", endOffset: "2 minutes" },
+      { name: "shared_energy_2s", endOffset: "2 minutes" },
+      { name: "shared_sensor_telemetry_1s", endOffset: "2 minutes" },
     ]) {
       await pool.query(
         `
@@ -183,12 +204,12 @@ export async function ensureSchema() {
           SELECT add_continuous_aggregate_policy(
             $1,
             start_offset => make_interval(hours => $2),
-            end_offset => INTERVAL '2 minutes',
+            end_offset => $3::interval,
             schedule_interval => INTERVAL '1 minute',
             if_not_exists => FALSE
           );
         `,
-        [view, aggregateRefreshHours],
+        [view, aggregateRefreshHours, endOffset],
       );
     }
   }
@@ -215,6 +236,15 @@ export async function ensureSchema() {
   await pool.query(`
     CREATE INDEX IF NOT EXISTS idx_sensor_readings_district_ts ON sensor_readings (district, ts DESC);
   `);
+
+  if (dbMode === "plain") {
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_shared_telemetry_benchmark
+      ON sensor_readings (ts)
+      INCLUDE (district, sensor_id, temperature, cpu, network, energy_kwh)
+      WHERE metric = 'telemetry' AND source = 'shared-simulator';
+    `);
+  }
 }
 
 export async function query<T extends Record<string, unknown> = Record<string, unknown>>(

@@ -117,181 +117,68 @@ app.get("/api/alerts", async (_req, res) => {
   res.json({ mode: dbMode, alerts: rows });
 });
 
-app.get("/api/queries/performance", async (_req, res) => {
-  const plainQueries = [
+app.get("/api/queries/performance", async (req, res) => {
+  const targetRows = 50_000;
+  const timedRuns = 2;
+  const requestedAt = req.query.at;
+  const anchor =
+    requestedAt === undefined
+      ? new Date()
+      : typeof requestedAt === "string"
+        ? new Date(requestedAt)
+        : new Date(Number.NaN);
+  if (Number.isNaN(anchor.getTime())) {
+    res.status(400).json({ error: "El parámetro at debe ser una fecha ISO válida." });
+    return;
+  }
+  const minuteBoundary = Math.floor(anchor.getTime() / 60_000) * 60_000;
+  const windowEnd = new Date(minuteBoundary - 3 * 60_000);
+  const windowStart = new Date(windowEnd.getTime() - 3 * 60_000);
+  const benchmarks = [
     {
-      name: "rolling_window_avg",
-      title: "Temperatura media por barrio",
-      sql: `
-        SELECT date_bin('1 second', ts, TIMESTAMPTZ '2000-01-01 00:00:00+00') AS bucket,
-          district, AVG(temperature) AS avg_temperature
-        FROM sensor_readings
-        WHERE metric = 'telemetry' AND source = 'shared-simulator'
-          AND ts >= date_trunc('minute', NOW()) - INTERVAL '30 minutes'
-          AND ts < date_trunc('minute', NOW())
-        GROUP BY bucket, district
-        ORDER BY bucket, district;
-      `,
+      name: "temperature_samples",
+      title: "Temperatura media por sensor y segundo",
+      value: "AVG(temperature) AS avg_temperature",
+      timescaleValue: "avg_temperature",
     },
     {
-      name: "hot_spots",
-      title: "Picos de carga (CPU/red)",
-      sql: `
-        SELECT date_bin('1 minute', ts, TIMESTAMPTZ '2000-01-01 00:00:00+00') AS bucket,
-          district, sensor_id, MAX(cpu) AS peak_cpu, AVG(network) AS avg_network
-        FROM sensor_readings
-        WHERE metric = 'telemetry' AND source = 'shared-simulator'
-          AND ts >= date_trunc('minute', NOW()) - INTERVAL '20 minutes'
-          AND ts < date_trunc('minute', NOW())
-        GROUP BY bucket, district, sensor_id
-        ORDER BY bucket, peak_cpu DESC;
-      `,
+      name: "cpu_network_samples",
+      title: "Pico CPU y media de red por sensor y segundo",
+      value: "MAX(cpu) AS peak_cpu, AVG(network) AS avg_network",
+      timescaleValue: "peak_cpu, avg_network",
     },
     {
-      name: "time_bucket_rollup",
-      title: "Consumo eléctrico por barrio",
-      sql: `
-        SELECT date_bin('2 seconds', ts, TIMESTAMPTZ '2000-01-01 00:00:00+00') AS bucket,
-          district, SUM(energy_kwh) AS energy_kwh
-        FROM sensor_readings
-        WHERE metric = 'telemetry' AND source = 'shared-simulator'
-          AND ts >= date_trunc('minute', NOW()) - INTERVAL '1 hour'
-          AND ts < date_trunc('minute', NOW())
-        GROUP BY bucket, district
-        ORDER BY bucket, district;
-      `,
+      name: "energy_samples",
+      title: "Consumo eléctrico por sensor y segundo",
+      value: "SUM(energy_kwh) AS energy_kwh",
+      timescaleValue: "energy_kwh",
     },
-  ];
-
-  const timescaleQueries = [
-    {
-      name: "rolling_window_avg",
-      title: "Temperatura media por barrio",
-      sql: `
-        WITH bounds AS (
-          SELECT
-            time_bucket(
-              '1 second',
-              date_trunc('minute', NOW()) - INTERVAL '30 minutes',
-              TIMESTAMPTZ '2000-01-01 00:00:00+00'
-            ) AS from_bucket,
-            time_bucket(
-              '1 second',
-              date_trunc('minute', NOW()) - INTERVAL '2 minutes',
-              TIMESTAMPTZ '2000-01-01 00:00:00+00'
-            ) AS realtime_from,
-            date_trunc('minute', NOW()) AS end_bucket
-        ),
-        aggregated AS (
-          SELECT bucket, district, avg_temperature
-          FROM shared_telemetry_1s, bounds
-          WHERE bucket >= from_bucket AND bucket < realtime_from
-          UNION ALL
-          SELECT
-            time_bucket(
-              '1 second',
-              ts,
-              TIMESTAMPTZ '2000-01-01 00:00:00+00'
-            ) AS bucket,
-              district,
-              AVG(temperature) AS avg_temperature
-            FROM sensor_readings, bounds
+  ].map((benchmark) => ({
+    name: benchmark.name,
+    title: benchmark.title,
+    sql: `
+      ${
+        dbMode === "timescale"
+          ? `
+            SELECT bucket, district, sensor_id, ${benchmark.timescaleValue}
+            FROM shared_sensor_telemetry_1s
+            WHERE bucket >= $1 AND bucket < $2
+            ORDER BY bucket, district, sensor_id
+            LIMIT ${targetRows};
+          `
+          : `
+            SELECT date_bin('1 second', ts, TIMESTAMPTZ '2000-01-01 00:00:00+00') AS bucket,
+              district, sensor_id, ${benchmark.value}
+            FROM sensor_readings
             WHERE metric = 'telemetry' AND source = 'shared-simulator'
-              AND ts >= realtime_from AND ts < end_bucket
-            GROUP BY bucket, district
-        )
-        SELECT bucket, district, avg_temperature
-        FROM aggregated
-        ORDER BY bucket, district;
-      `,
-    },
-    {
-      name: "hot_spots",
-      title: "Picos de carga (CPU/red)",
-      sql: `
-        WITH bounds AS (
-          SELECT
-            time_bucket(
-              '1 minute',
-              date_trunc('minute', NOW()) - INTERVAL '20 minutes',
-              TIMESTAMPTZ '2000-01-01 00:00:00+00'
-            ) AS from_bucket,
-            time_bucket(
-              '1 minute',
-              date_trunc('minute', NOW()) - INTERVAL '2 minutes',
-              TIMESTAMPTZ '2000-01-01 00:00:00+00'
-            ) AS realtime_from,
-            date_trunc('minute', NOW()) AS end_bucket
-        ),
-        aggregated AS (
-          SELECT bucket, district, sensor_id, peak_cpu, avg_network
-          FROM shared_peaks_1m, bounds
-          WHERE bucket >= from_bucket AND bucket < realtime_from
-          UNION ALL
-          SELECT
-            time_bucket(
-              '1 minute',
-              ts,
-              TIMESTAMPTZ '2000-01-01 00:00:00+00'
-            ) AS bucket,
-            district,
-            sensor_id,
-            MAX(cpu) AS peak_cpu,
-            AVG(network) AS avg_network
-          FROM sensor_readings, bounds
-          WHERE metric = 'telemetry' AND source = 'shared-simulator'
-            AND ts >= realtime_from AND ts < end_bucket
-          GROUP BY bucket, district, sensor_id
-        )
-        SELECT bucket, district, sensor_id, peak_cpu, avg_network
-        FROM aggregated
-        ORDER BY bucket, peak_cpu DESC;
-      `,
-    },
-    {
-      name: "time_bucket_rollup",
-      title: "Consumo eléctrico por barrio",
-      sql: `
-        WITH bounds AS (
-          SELECT
-            time_bucket(
-              '2 seconds',
-              date_trunc('minute', NOW()) - INTERVAL '1 hour',
-              TIMESTAMPTZ '2000-01-01 00:00:00+00'
-            ) AS from_bucket,
-            time_bucket(
-              '2 seconds',
-              date_trunc('minute', NOW()) - INTERVAL '2 minutes',
-              TIMESTAMPTZ '2000-01-01 00:00:00+00'
-            ) AS realtime_from,
-            date_trunc('minute', NOW()) AS end_bucket
-        ),
-        aggregated AS (
-          SELECT bucket, district, energy_kwh
-          FROM shared_energy_2s, bounds
-          WHERE bucket >= from_bucket AND bucket < realtime_from
-          UNION ALL
-          SELECT
-            time_bucket(
-              '2 seconds',
-              ts,
-              TIMESTAMPTZ '2000-01-01 00:00:00+00'
-            ) AS bucket,
-            district,
-            SUM(energy_kwh) AS energy_kwh
-          FROM sensor_readings, bounds
-          WHERE metric = 'telemetry' AND source = 'shared-simulator'
-            AND ts >= realtime_from AND ts < end_bucket
-          GROUP BY bucket, district
-        )
-        SELECT bucket, district, energy_kwh
-        FROM aggregated
-        ORDER BY bucket, district;
-      `,
-    },
-  ];
-
-  const benchmarks = dbMode === "timescale" ? timescaleQueries : plainQueries;
+              AND ts >= $1 AND ts < $2
+            GROUP BY bucket, district, sensor_id
+            ORDER BY bucket, district, sensor_id
+            LIMIT ${targetRows};
+          `
+      }
+    `,
+  }));
 
   type ExplainAnalyzeDocument = {
     "QUERY PLAN": Array<{
@@ -305,18 +192,46 @@ app.get("/api/queries/performance", async (_req, res) => {
   const results = [] as Array<{ name: string; title: string; ms: number; rows: number; sql: string; engine: string }>;
 
   for (const benchmark of benchmarks) {
-    const explainResult = await query<ExplainAnalyzeDocument>(
-      `EXPLAIN (ANALYZE, FORMAT JSON) ${benchmark.sql}`,
-    );
-    const analysis = explainResult.rows[0]?.["QUERY PLAN"]?.[0];
-    if (!analysis) {
-      throw new Error(`La base de datos no devolvió el plan de ejecución para ${benchmark.name}`);
+    const run = async () => {
+      const explainResult = await query<ExplainAnalyzeDocument>(
+        `EXPLAIN (ANALYZE, FORMAT JSON) ${benchmark.sql}`,
+        [windowStart, windowEnd],
+      );
+      const analysis = explainResult.rows[0]?.["QUERY PLAN"]?.[0];
+      if (!analysis) {
+        throw new Error(`La base de datos no devolvió el plan de ejecución para ${benchmark.name}`);
+      }
+      return {
+        ms: analysis["Execution Time"],
+        rows: Math.round(
+          (analysis.Plan["Actual Rows"] ?? 0) * (analysis.Plan["Actual Loops"] ?? 1),
+        ),
+      };
+    };
+
+    const warmupRun = await run();
+    const measuredRuns = [];
+    for (let runIndex = 0; runIndex < timedRuns; runIndex++) {
+      measuredRuns.push(await run());
     }
+    const invalidRun = [warmupRun, ...measuredRuns].find(
+      (result) => result.rows !== targetRows,
+    );
+    if (invalidRun) {
+      res.status(503).json({
+        error: `La consulta ${benchmark.name} produjo ${invalidRun.rows} filas reales; se requieren exactamente ${targetRows}.`,
+        expectedRows: targetRows,
+        availableRows: invalidRun.rows,
+      });
+      return;
+    }
+    const averageMs =
+      measuredRuns.reduce((sum, result) => sum + result.ms, 0) / measuredRuns.length;
     results.push({
       name: benchmark.name,
       title: benchmark.title,
-      ms: Number(analysis["Execution Time"].toFixed(2)),
-      rows: Math.round((analysis.Plan["Actual Rows"] ?? 0) * (analysis.Plan["Actual Loops"] ?? 1)),
+      ms: Number(averageMs.toFixed(2)),
+      rows: measuredRuns[0].rows,
       sql: benchmark.sql.replace(/\s+/g, " ").trim(),
       engine: dbMode === "timescale" ? "TimescaleDB" : "PostgreSQL",
     });
@@ -327,10 +242,14 @@ app.get("/api/queries/performance", async (_req, res) => {
   res.json({
     mode: dbMode,
     averageMs: Number(avgMs.toFixed(2)),
+    window: { start: windowStart.toISOString(), end: windowEnd.toISOString() },
     queries: results,
     benchmark: {
-      label: dbMode === "timescale" ? "TimescaleDB optimized" : "Baseline PostgreSQL",
-      summary: dbMode === "timescale" ? "Hypertable + time_bucket for efficient time-window queries." : "Standard relational aggregation without time-series optimization.",
+      label: dbMode === "timescale" ? "TimescaleDB continuous aggregate" : "Baseline PostgreSQL",
+      summary: dbMode === "timescale"
+        ? "1-second per-sensor continuous aggregate; refreshed every minute with a 2-minute end offset."
+        : "Raw aggregation over the same telemetry using PostgreSQL's time index, one warm-up and two timed runs.",
+      maintenanceIncluded: false,
     },
   });
 });

@@ -51,13 +51,23 @@ const EMPTY_STATE: ComparisonState = {
   plain: { snapshot: null, error: null },
 };
 
-async function fetchBackend(mode: BackendMode): Promise<BackendSnapshot> {
+async function fetchBackend(mode: BackendMode, benchmarkAt: string): Promise<BackendSnapshot> {
   const base = BACKENDS[mode].url;
   const [overviewRes, performanceRes] = await Promise.all([
     fetch(`${base}/api/overview`, { signal: AbortSignal.timeout(30_000) }),
-    fetch(`${base}/api/queries/performance`, { signal: AbortSignal.timeout(30_000) }),
+    fetch(
+      `${base}/api/queries/performance?at=${encodeURIComponent(benchmarkAt)}`,
+      { signal: AbortSignal.timeout(30_000) },
+    ),
   ]);
   if (!overviewRes.ok || !performanceRes.ok) {
+    const failedResponse = !performanceRes.ok ? performanceRes : overviewRes;
+    if (failedResponse.headers.get("content-type")?.includes("application/json")) {
+      const payload = (await failedResponse.json()) as { error?: unknown };
+      if (typeof payload.error === "string") {
+        throw new Error(payload.error);
+      }
+    }
     throw new Error(`La API respondió con error (${overviewRes.status}/${performanceRes.status})`);
   }
 
@@ -92,10 +102,11 @@ function Dashboard() {
     let cancelled = false;
     const refresh = async () => {
       setLoading(true);
+      const benchmarkAt = new Date().toISOString();
       const results = await Promise.all(
         (Object.keys(BACKENDS) as BackendMode[]).map(async (mode) => {
           try {
-            return [mode, { snapshot: await fetchBackend(mode), error: null }] as const;
+            return [mode, { snapshot: await fetchBackend(mode, benchmarkAt), error: null }] as const;
           } catch (error) {
             return [
               mode,
@@ -194,25 +205,8 @@ function ComparisonCharts({ comparison }: { comparison: ComparisonState }) {
   }
   const queryData = Array.from(queryMap.values());
 
-  const districtMap = new Map<
-    string,
-    { district: string; timescale: number | null; plain: number | null }
-  >();
-  for (const mode of Object.keys(BACKENDS) as BackendMode[]) {
-    for (const row of comparison[mode].snapshot?.overview ?? []) {
-      const district = districtMap.get(row.district) ?? {
-        district: row.district,
-        timescale: null,
-        plain: null,
-      };
-      district[mode] = row.avg_temperature;
-      districtMap.set(row.district, district);
-    }
-  }
-  const districtData = Array.from(districtMap.values());
-
   return (
-    <section className="mb-5 grid gap-5 xl:grid-cols-2" aria-label="Gráficas comparativas">
+    <section className="mb-5 grid gap-5" aria-label="Gráficas comparativas">
       <ComparisonChart title="Latencia por consulta" unit="ms">
         {queryData.length ? (
           <>
@@ -266,61 +260,6 @@ function ComparisonCharts({ comparison }: { comparison: ComparisonState }) {
         )}
       </ComparisonChart>
 
-      <ComparisonChart title="Temperatura media por barrio" unit="°C">
-        {districtData.length ? (
-          <>
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={districtData} margin={{ top: 8, right: 8, bottom: 0, left: -18 }}>
-                <CartesianGrid vertical={false} stroke="var(--border)" strokeOpacity={0.6} />
-                <XAxis
-                  dataKey="district"
-                  tick={{ fill: "var(--muted-foreground)", fontSize: 10 }}
-                  axisLine={false}
-                  tickLine={false}
-                />
-                <YAxis
-                  tick={{ fill: "var(--muted-foreground)", fontSize: 10 }}
-                  axisLine={false}
-                  tickLine={false}
-                />
-                <Tooltip
-                  formatter={(value, name) => [
-                    `${Number(value).toLocaleString("es-ES", { maximumFractionDigits: 1 })} °C`,
-                    name,
-                  ]}
-                  contentStyle={{
-                    background: "var(--card)",
-                    borderColor: "var(--border)",
-                    fontSize: 11,
-                  }}
-                />
-                <Bar
-                  dataKey="timescale"
-                  name="TimescaleDB"
-                  fill={BACKENDS.timescale.accent}
-                  radius={[3, 3, 0, 0]}
-                />
-                <Bar
-                  dataKey="plain"
-                  name="PostgreSQL"
-                  fill={BACKENDS.plain.accent}
-                  radius={[3, 3, 0, 0]}
-                />
-              </BarChart>
-            </ResponsiveContainer>
-            <ChartValues
-              rows={districtData.map((row) => ({
-                label: row.district,
-                timescale: row.timescale,
-                plain: row.plain,
-                unit: " °C",
-              }))}
-            />
-          </>
-        ) : (
-          <ChartEmpty />
-        )}
-      </ComparisonChart>
     </section>
   );
 }

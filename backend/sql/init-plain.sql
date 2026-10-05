@@ -19,3 +19,7 @@ CREATE INDEX IF NOT EXISTS idx_sensor_readings_telemetry_ts
   ON sensor_readings (ts DESC) WHERE metric = 'telemetry';
 CREATE INDEX IF NOT EXISTS idx_sensor_readings_sensor_ts ON sensor_readings (sensor_id, ts DESC);
 CREATE INDEX IF NOT EXISTS idx_sensor_readings_district_ts ON sensor_readings (district, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_shared_telemetry_benchmark
+  ON sensor_readings (ts)
+  INCLUDE (district, sensor_id, temperature, cpu, network, energy_kwh)
+  WHERE metric = 'telemetry' AND source = 'shared-simulator';
