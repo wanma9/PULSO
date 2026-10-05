@@ -33,6 +33,7 @@ services:
     restart: unless-stopped
     depends_on:
       - postgres-plain
+      - postgres-timescale
     environment:
       DB_MODE: plain
       PORT: 4001
@@ -41,7 +42,11 @@ services:
       DB_NAME: pulse_plain
       DB_USER: pulse
       DB_PASSWORD: pulse
-      CORS_ORIGIN: http://localhost:5173
+      DB_PEER_HOST: postgres-timescale
+      DB_PEER_PORT: 5432
+      DB_PEER_NAME: pulse_timescale
+      DATA_RETENTION_HOURS: ${DATA_RETENTION_HOURS:-1}
+      CORS_ORIGIN: "${FRONTEND_ORIGIN:-http://localhost:5173,http://localhost:8080}"
     ports:
       - "4001:4001"
 
@@ -59,7 +64,8 @@ services:
       DB_NAME: pulse_timescale
       DB_USER: pulse
       DB_PASSWORD: pulse
-      CORS_ORIGIN: http://localhost:5173
+      DATA_RETENTION_HOURS: ${DATA_RETENTION_HOURS:-1}
+      CORS_ORIGIN: "${FRONTEND_ORIGIN:-http://localhost:5173,http://localhost:8080}"
     ports:
       - "4002:4002"
 

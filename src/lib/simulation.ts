@@ -7,7 +7,10 @@ export const DISTRICTS = ["Centro", "Norte", "Sur", "Este", "Oeste", "Puerto"] a
 export type District = (typeof DISTRICTS)[number];
 export type Range = "1m" | "5m" | "1h" | "24h" | "7d";
 
-export const RANGES: Record<Range, { points: number; bucket: string; interval: string; label: string }> = {
+export const RANGES: Record<
+  Range,
+  { points: number; bucket: string; interval: string; label: string }
+> = {
   "1m": { points: 60, bucket: "1 second", interval: "1 minute", label: "1 s" },
   "5m": { points: 150, bucket: "2 seconds", interval: "5 minutes", label: "2 s" },
   "1h": { points: 60, bucket: "1 minute", interval: "1 hour", label: "1 min" },
@@ -15,7 +18,14 @@ export const RANGES: Record<Range, { points: number; bucket: string; interval: s
   "7d": { points: 84, bucket: "2 hours", interval: "7 days", label: "2 h" },
 };
 
-const BASE_TEMP: Record<District, number> = { Centro: 24, Norte: 20, Sur: 26, Este: 22, Oeste: 21, Puerto: 19 };
+const BASE_TEMP: Record<District, number> = {
+  Centro: 24,
+  Norte: 20,
+  Sur: 26,
+  Este: 22,
+  Oeste: 21,
+  Puerto: 19,
+};
 const SENSORS = 12480;
 const HISTORY = 150;
 
@@ -116,7 +126,11 @@ function initialState() {
   // Heatmap: 24 hours x districts
   const hr = mulberry32(7);
   const heat = DISTRICTS.map((d) =>
-    Array.from({ length: 24 }, (_, h) => +(BASE_TEMP[d] - 4 + Math.sin(((h - 9) / 24) * Math.PI * 2) * 5 + hr() * 1.5).toFixed(1)),
+    Array.from(
+      { length: 24 },
+      (_, h) =>
+        +(BASE_TEMP[d] - 4 + Math.sin(((h - 9) / 24) * Math.PI * 2) * 5 + hr() * 1.5).toFixed(1),
+    ),
   );
   return {
     history,
@@ -156,13 +170,21 @@ export function useSimulation(running: boolean) {
           arr[arr.length - 1] = nextReading(tail, rnd, s.tickCount);
           longRange[k] = arr;
         });
-        const ingest = Math.round(Math.max(38000, Math.min(62000, s.ingest + (rnd() - 0.5) * 3000)));
+        const ingest = Math.round(
+          Math.max(38000, Math.min(62000, s.ingest + (rnd() - 0.5) * 3000)),
+        );
         const newFeed: FeedItem[] = Array.from({ length: 2 }, () => {
           const d = DISTRICTS[Math.floor(rnd() * DISTRICTS.length)]!;
           const m = Math.floor(rnd() * 4);
           const metric = ["temp", "humedad", "aqi", "energía"][m]!;
           const value =
-            m === 0 ? `${next.temp[d].toFixed(1)} °C` : m === 1 ? `${next.humidity}%` : m === 2 ? `${next.aqi}` : `${(next.energy / 6).toFixed(1)} kW`;
+            m === 0
+              ? `${next.temp[d].toFixed(1)} °C`
+              : m === 1
+                ? `${next.humidity}%`
+                : m === 2
+                  ? `${next.aqi}`
+                  : `${(next.energy / 6).toFixed(1)} kW`;
           return {
             id: ++feedId.current,
             sensor: `${d.slice(0, 3).toUpperCase()}-${String(Math.floor(rnd() * 2080)).padStart(4, "0")}`,
@@ -173,8 +195,8 @@ export function useSimulation(running: boolean) {
         });
         const bench = s.bench.map((b, i) => ({
           ...b,
-          tsdb: +Math.max(3, (6 + i * 4) + (rnd() - 0.5) * 3).toFixed(1),
-          pg: Math.round((520 + i * 380) + (rnd() - 0.5) * 120),
+          tsdb: +Math.max(3, 6 + i * 4 + (rnd() - 0.5) * 3).toFixed(1),
+          pg: Math.round(520 + i * 380 + (rnd() - 0.5) * 120),
         }));
         return {
           ...s,
@@ -206,4 +228,5 @@ export function seriesFor(state: SimState, range: Range): Reading[] {
 
 export { SENSORS };
 
-export const fmt = (n: number, d = 0) => n.toLocaleString("es-ES", { minimumFractionDigits: d, maximumFractionDigits: d });
+export const fmt = (n: number, d = 0) =>
+  n.toLocaleString("es-ES", { minimumFractionDigits: d, maximumFractionDigits: d });

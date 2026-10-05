@@ -7,6 +7,22 @@
 import { defineConfig } from "@lovable.dev/vite-tanstack-config";
 
 export default defineConfig({
+  vite: {
+    server: {
+      proxy: {
+        "/api/timescale": {
+          target: "http://localhost:4002",
+          changeOrigin: true,
+          rewrite: (path) => path.replace(/^\/api\/timescale/, "/api"),
+        },
+        "/api/postgres": {
+          target: "http://localhost:4001",
+          changeOrigin: true,
+          rewrite: (path) => path.replace(/^\/api\/postgres/, "/api"),
+        },
+      },
+    },
+  },
   tanstackStart: {
     // Redirect TanStack Start's bundled server entry to src/server.ts (our SSR error wrapper).
     // nitro/vite builds from this
